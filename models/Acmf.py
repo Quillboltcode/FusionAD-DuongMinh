@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 class ChannelAttention(nn.Module):
@@ -107,16 +107,35 @@ class ACMF(nn.Module):
 
 if __name__ == "__main__":
     # Define a dummy input for testing
-    batch_size = 1
-    in_channels_img = 768
-    in_channels_evt = 768
+    feature_dim = 768
+    illumination_net = ACMF(in_channels_evt=feature_dim, in_channels_img=feature_dim)
 
-    F_img_t = torch.randn(batch_size, 768,28, 28)
-    F_evt_t = torch.randn(batch_size, 768, 28, 28)
+    # Example low-light image tensor for input
+    low_light_image = torch.randn(2, 768 ,224,224)  # Batch size 1, 3 color channels, 224x224 resolution
 
+    # Enable GPU if available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using {device} device")
+    illumination_net = illumination_net.to(device)
+    low_light_image = low_light_image.to(device)
 
-    # Initialize the ACMF module
-    acmf = ACMF(in_channels_img, in_channels_evt)
-    # Test the forward pass
-    output = acmf(F_img_t, F_evt_t)
-    print(output.shape) # [50176,768]
+    # Define a dummy optimizer
+    optimizer = torch.optim.Adam(illumination_net.parameters(), lr=0.001)
+
+    # Start profiling
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                profile_memory=True,
+                record_shapes=True) as prof:
+        # Record each part of the model's forward pass
+        with record_function("model_forward"):
+            illumination_vector = illumination_net(low_light_image, low_light_image)
+
+        # Backward pass to profile gradients
+        with record_function("model_backward"):
+            optimizer.zero_grad()
+            loss = illumination_vector.sum()  # Dummy loss
+            loss.backward()
+            optimizer.step()
+
+    # Print profiling results
+    print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))

@@ -1,7 +1,5 @@
 import argparse
-from email.policy import default
 
-from torch.profiler import profile, record_function, ProfilerActivity
 import os
 import torch
 import wandb
@@ -16,10 +14,10 @@ import torchvision.transforms as T
 from models.Acmf import ACMF
 # from models.ad_models import FeatureExtractors
 # from models.feature_transfer_nets import FeatureProjectionMLP, FeatureProjectionMLP_big
-from dataset2D import *
-from models.features2d import Multimodal2DFeatures
-from models.dataset import BaseAnomalyDetectionDataset
-from models.idea1 import Idea1
+from dataset2D import get_dataloader
+from models.idea2 import MultiModalNet
+from utils.metrics_utils import calculate_au_pro
+from utils.general_utils import set_seeds, SquarePad
 
 
 def set_seeds(sid=115):
@@ -53,72 +51,54 @@ def train(args):
 
     # Dataloader.
     train_loader = get_dataloader(
-        os.path.join(args.dataset_path, args.class_name, "normal"), common, common, 4, 16, True)
+        os.path.join(args.dataset_path, args.class_name, "normal"), common, common, args.batch_size, 16, True)
 
     # Feature extractors.
-    feature_extractor = Idea1(image_size=224)
+    model = MultiModalNet(feature_dim=768)
 
     # Model instantiation.
-    ACMF_module = ACMF(in_channels_img=768, in_channels_evt=768)
 
-    optimizer = torch.optim.Adam(params=chain(ACMF_module.parameters()))
+    optimizer = torch.optim.Adam(params=chain(model.illumination_net.parameters(),
+                                              model.feature_enhancement.parameters(),
+                                              model.feature_prediction.parameters(),)
+                                )
 
-    ACMF_module.to(device)
-    feature_extractor.to(device)
+    model.to(device)
 
     metric = torch.nn.CosineSimilarity(dim=-1, eps=1e-06)
-    
+    loss_fn_enhancement = torch.nn.MSELoss()
 
     for epoch in trange(
-        args.epochs_no, desc=f"Training Feature Transfer Net.{args.class_name}"
+        args.epochs_no, desc=f"MutiModalNet.{args.class_name}"
     ):
-        ACMF_module.train()
+        model.train()
         epoch_cos_sim = []
         for i, (well_image, lowlight) in enumerate(
             tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs_no}")
         ):
-            well_image, lowlight = well_image.to(device), lowlight.to(device)
+            well_image, lowlight = well_image.to(device), lowlight.to(device)            
+            # if args.batch_size == 1:               
+            well_lit_features, enhanced_features, predicted_features, predicted_upsampled_features, well_lit_upsampled_features = model(lowlight, well_image)
+            
+            loss_enhacement = loss_fn_enhancement(enhanced_features, well_lit_features)
 
-            # features, features_lowlight = feature_extractor.get_features_maps(images, lowlight)
-
-            if args.batch_size == 1:
-                well_lit, low_light = feature_extractor.get_features_maps(
-                    well_image, lowlight)
-            else:
-                rgb_patches = []
-                xyz_patches = []
-                transfer_patches = []
-
-                for i in range(well_image.shape[0]):
-                    rgb_patch, xyz_patch = feature_extractor.get_features_maps(well_image[i].unsqueeze(dim=0),
-                                                                               lowlight[i].unsqueeze(dim=0))
-
-                    
-                    adaptive_features = ACMF_module(xyz_patch.permute(0, 3, 1, 2))
-                    
-
-                    rgb_patches.append(rgb_patch)
-                    xyz_patches.append(xyz_patch)
-                    transfer_patches.append(adaptive_features.permute(0, 2, 3, 1))
-                well_lit = torch.stack(rgb_patches, dim=0)
-                low_light = torch.stack(xyz_patches, dim=0)
-                transfer_features = torch.stack(transfer_patches, dim=0)
-
+            
             # -------------------------------------------------
-            low_light_mask = (low_light.sum(axis=-1) == 0)
+            mask = (predicted_upsampled_features.sum(axis=-1) == 0)
             # loss = 1 - \
             #     metric(transfer_features[~low_light_mask],
             #            images[~low_light_mask]).mean()
 
-            loss = 1 - metric(transfer_features[~low_light_mask],well_lit[~low_light_mask]).mean()
+            loss_predicton = 1 - metric(predicted_upsampled_features[~mask],well_lit_upsampled_features[~mask]).mean()
             # loss = 1 - metric(images, transfer_features).mean()
             #-------------------------------------------------
             # 1. la 2 loss, w-t, r-t
             # 2. using well light mask
             # 3. dung 2 mlp
             #---------------------------------------------------
-            epoch_cos_sim.append(loss.item())
-            if not torch.isnan(loss) and not torch.isinf(loss):
+            # epoch_cos_sim.append(loss.item())
+            loss = loss_enhacement + loss_predicton
+            if not torch.isnan(loss_enhacement) and not torch.isinf(loss_predicton):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -133,7 +113,7 @@ def train(args):
             os.mkdir(args.checkpoint_folder)
         if (epoch + 1) % args.save_interval == 0:
             torch.save(
-                ACMF_module.state_dict(),
+                MultiModalNet.state_dict(),
                 f"{args.checkpoint_folder}/{args.class_name}/{model_name}",
             )
 
